@@ -8,7 +8,7 @@ on:
 env:
   REMOTE_DIR: /home/flipkart.xai2100he.cloud/app
   PM2_NAME: flipkart
-  # Change to the actual backend entry file of the repo (e.g. server.js or backend/server.js)
+  # Change to the real backend entry file of the repo (e.g. server.js or backend/server.js)
   ENTRY_FILE: server.js
 
 jobs:
@@ -34,17 +34,47 @@ jobs:
           fi
 
       - name: Setup SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
         run: |
+          [ -n "$SSH_HOST" ] || { echo "ERROR: SSH_HOST secret is empty"; exit 1; }
+          [ -n "$SSH_USER" ] || { echo "ERROR: SSH_USER secret is empty"; exit 1; }
+          [ -n "$SSH_KEY" ]  || { echo "ERROR: SSH_PRIVATE_KEY secret is empty"; exit 1; }
+
           mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+          chmod 700 ~/.ssh
+
+          # write key, strip Windows line endings, make sure it ends with a newline
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+          # validate the key format
+          ssh-keygen -y -f ~/.ssh/id_deploy > /dev/null \
+            || { echo "ERROR: SSH_PRIVATE_KEY is not a valid private key (paste the full BEGIN...END block)"; exit 1; }
+
+          # trust the server, do not fail the build on keyscan quirks
+          ssh-keyscan -T 15 -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          cat > ~/.ssh/config <<CFG
+          Host deploy-server
+            HostName $SSH_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 30
+          CFG
+          sed -i 's/^          //' ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          ssh -o BatchMode=yes -o ConnectTimeout=20 deploy-server "echo SSH connection OK"
 
       - name: Prepare remote folder
-        run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
+        run: ssh deploy-server "mkdir -p ${{ env.REMOTE_DIR }}"
 
-      - name: Upload code and build
+      - name: Upload code
         run: |
           rsync -avz --delete \
             --exclude '.git' \
@@ -53,11 +83,11 @@ jobs:
             --exclude 'frontend/node_modules' \
             --exclude '.env' \
             --exclude 'config/config.env' \
-            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.REMOTE_DIR }}/
+            ./ deploy-server:${{ env.REMOTE_DIR }}/
 
       - name: Install dependencies and restart app
         run: |
-          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'REMOTE'
+          ssh deploy-server bash -s << 'REMOTE'
             set -e
             cd ${{ env.REMOTE_DIR }}
             npm install --omit=dev
@@ -72,4 +102,4 @@ jobs:
       - name: Health check
         run: |
           sleep 5
-          curl -fsSI https://flipkart.xai2100he.cloud || echo "Site not responding yet, check pm2 logs"
+          curl -fsSI https://flipkart.xai2100he.cloud || echo "Site not responding yet, check: pm2 logs ${{ env.PM2_NAME }}"
