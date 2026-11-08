@@ -1,0 +1,75 @@
+name: Deploy flipkart.xai2100he.cloud
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REMOTE_DIR: /home/flipkart.xai2100he.cloud/app
+  PM2_NAME: flipkart
+  # Change to the actual backend entry file of the repo (e.g. server.js or backend/server.js)
+  ENTRY_FILE: server.js
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend (if present)
+        run: |
+          if [ -d frontend ]; then
+            cd frontend
+            npm install
+            CI=false npm run build
+          else
+            echo "No frontend folder, skipping"
+          fi
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Prepare remote folder
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "mkdir -p ${{ env.REMOTE_DIR }}"
+
+      - name: Upload code and build
+        run: |
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            --exclude 'frontend/node_modules' \
+            --exclude '.env' \
+            --exclude 'config/config.env' \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ env.REMOTE_DIR }}/
+
+      - name: Install dependencies and restart app
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'REMOTE'
+            set -e
+            cd ${{ env.REMOTE_DIR }}
+            npm install --omit=dev
+            if pm2 describe ${{ env.PM2_NAME }} > /dev/null 2>&1; then
+              pm2 restart ${{ env.PM2_NAME }} --update-env
+            else
+              pm2 start ${{ env.ENTRY_FILE }} --name ${{ env.PM2_NAME }}
+            fi
+            pm2 save
+          REMOTE
+
+      - name: Health check
+        run: |
+          sleep 5
+          curl -fsSI https://flipkart.xai2100he.cloud || echo "Site not responding yet, check pm2 logs"
